@@ -1,0 +1,5 @@
+Flask==2.3.3
+psutil==5.9.5
+humanize==4.7.0
+requests==2.31.0
+send2trash==1.8.2
