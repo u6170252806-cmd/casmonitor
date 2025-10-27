@@ -1,0 +1,35 @@
+name: Run CasMonitor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          npm install -g localtunnel
+
+      - name: Run CasMonitor with tunnel
+        run: |
+          nohup python3 casmonitor.py &
+          sleep 8
+          lt --port 5000 --subdomain casmonitor-$GITHUB_RUN_ID > url.txt &
+          sleep 5
+          echo "Public URL:"
+          cat url.txt
+          echo "Keeping server alive for 8 minutes..."
+          sleep 480
+ 
