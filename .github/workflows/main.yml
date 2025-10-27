@@ -34,7 +34,7 @@ jobs:
           # fetch and show the tunnel password (runner's public IP)
           echo "Tunnel password (use this to unlock loca.lt prompt):"
           curl -s https://loca.lt/mytunnelpassword || true
-          echo "To access without the password via curl:"
+          echo "  To access without the password via curl:"
           echo 'curl -H "bypass-tunnel-reminder: 1" https://casmonitor-'"$GITHUB_RUN_ID"'.loca.lt'
           echo "Keeping server alive for 8 minutes..."
           sleep 480
