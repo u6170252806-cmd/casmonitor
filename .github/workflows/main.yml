@@ -22,14 +22,19 @@ jobs:
           pip install -r requirements.txt
           npm install -g localtunnel
 
-      - name: Run CasMonitor with tunnel
+      - name: Run CasMonitor with tunnel and show password
         run: |
-          nohup python3 casmonitor.py &
+          nohup python3 casmonitor.py > casmonitor.log 2>&1 &
           sleep 8
-          lt --port 5000 --subdomain casmonitor-$GITHUB_RUN_ID > url.txt &
+          # start localtunnel and capture its output
+          lt --port 5000 --subdomain casmonitor-$GITHUB_RUN_ID > url.txt 2>&1 &
           sleep 5
-          echo "Public URL:"
-          cat url.txt
+          echo "Public URL (from url.txt):"
+          cat url.txt || true
+          # fetch and show the tunnel password (runner's public IP)
+          echo "Tunnel password (use this to unlock loca.lt prompt):"
+          curl -s https://loca.lt/mytunnelpassword || true
+          echo "To access without the password via curl:"
+          echo 'curl -H "bypass-tunnel-reminder: 1" https://casmonitor-'"$GITHUB_RUN_ID"'.loca.lt'
           echo "Keeping server alive for 8 minutes..."
           sleep 480
- 
