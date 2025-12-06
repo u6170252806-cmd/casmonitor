@@ -18,8 +18,24 @@ import subprocess
 import re
 import uuid
 from pathlib import Path
+from werkzeug.utils import secure_filename
+import pty
+import select
+import struct
+import fcntl
+import termios
 
 app = Flask(__name__)
+
+# Terminal session management
+terminal_sessions = {}
+UPLOAD_FOLDER = os.getcwd()
+ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'py', 'js', 'html', 'css', 'json', 'md', 'cpp', 'c', 'h', 'sh', 'yaml', 'yml', 'xml', 'csv', 'log', 'conf', 'cfg', 'ini', 'sql', 'zip', 'tar', 'gz'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS or '.' not in filename
 
 # Configuration
 REFRESH_INTERVAL = 3000  # milliseconds
@@ -220,17 +236,20 @@ def get_file_list(path):
             full_path = os.path.join(path, item)
             try:
                 stat = os.stat(full_path)
+                is_dir = os.path.isdir(full_path)
                 files.append({
                     'name': item,
                     'path': full_path,
-                    'type': 'directory' if os.path.isdir(full_path) else 'file',
-                    'size': humanize.naturalsize(stat.st_size) if not os.path.isdir(full_path) else '-',
-                    'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                    'permissions': oct(stat.st_mode)[-3:]
+                    'type': 'directory' if is_dir else 'file',
+                    'size': humanize.naturalsize(stat.st_size) if not is_dir else '-',
+                    'modified': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M'),
+                    'permissions': oct(stat.st_mode)[-3:],
+                    'extension': os.path.splitext(item)[1].lower() if not is_dir else ''
                 })
             except (PermissionError, FileNotFoundError):
                 continue
-        return sorted(files, key=lambda x: (x['type'] != 'directory', x['name'].lower()))[:20]
+        # Sort: directories first, then by name (case-insensitive)
+        return sorted(files, key=lambda x: (x['type'] != 'directory', x['name'].lower()))[:100]
     except Exception as e:
         log_system_event('error', f'Error accessing {path}: {str(e)}')
         return []
@@ -693,6 +712,61 @@ HTML_TEMPLATE = """
             height: 100%;
             background-color: var(--success-color);
         }
+        /* Terminal styles */
+        .terminal-output {
+            scrollbar-width: thin;
+            scrollbar-color: #4a5568 #1e1e1e;
+        }
+        .terminal-output::-webkit-scrollbar {
+            width: 8px;
+        }
+        .terminal-output::-webkit-scrollbar-track {
+            background: #1e1e1e;
+        }
+        .terminal-output::-webkit-scrollbar-thumb {
+            background-color: #4a5568;
+            border-radius: 4px;
+        }
+        .terminal-command {
+            color: #4ec9b0;
+        }
+        .terminal-output-text {
+            color: #d4d4d4;
+        }
+        .terminal-error {
+            color: #f14c4c;
+        }
+        .terminal-success {
+            color: #89d185;
+        }
+        .terminal-info {
+            color: #3794ff;
+        }
+        /* Upload section styles */
+        .upload-section {
+            background: var(--card-bg);
+            border-color: var(--border-color) !important;
+        }
+        .upload-section:hover {
+            border-color: var(--accent-color) !important;
+        }
+        #file-editor {
+            background: var(--card-bg);
+            color: var(--text-color);
+            border-color: var(--border-color);
+        }
+        [data-theme="dark"] #file-editor {
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        [data-theme="dark"] #terminal-input {
+            background: #1e1e1e !important;
+            color: #d4d4d4 !important;
+        }
+        .file-action-btn {
+            padding: 2px 6px;
+            font-size: 11px;
+        }
     </style>
 </head>
 <body>
@@ -845,6 +919,9 @@ HTML_TEMPLATE = """
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="disk-tab" data-bs-toggle="tab" data-bs-target="#disk" type="button" role="tab">Disks</button>
             </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="terminal-tab" data-bs-toggle="tab" data-bs-target="#terminal" type="button" role="tab">Terminal</button>
+            </li>
         </ul>
         <div class="tab-content" id="systemTabContent">
             <!-- Processes Tab -->
@@ -925,18 +1002,51 @@ HTML_TEMPLATE = """
                             </h6>
                             <div class="d-flex justify-content-between align-items-center mb-2">
                                 <div class="input-group input-group-sm" style="width: 100%;">
-                                    <input type="text" class="form-control" id="current-path" value="/" style="width: 100%;">
+                                    <input type="text" class="form-control" id="current-path" value="{{ cwd }}" style="width: 100%;">
                                     <button class="btn btn-outline-primary" type="button" onclick="updateFileList()">
                                         <i class="bi bi-folder2-open"></i>
                                     </button>
+                                    <button class="btn btn-outline-secondary" type="button" onclick="goUpDirectory()">
+                                        <i class="bi bi-arrow-up"></i>
+                                    </button>
+                                    <button class="btn btn-outline-info" type="button" onclick="goToHome()">
+                                        <i class="bi bi-house"></i>
+                                    </button>
                                 </div>
                             </div>
-                            <div class="file-list" id="file-list-container">
+                            <!-- File Upload Section -->
+                            <div class="upload-section mb-3 p-2 border rounded">
+                                <h6 class="mb-2"><i class="bi bi-cloud-upload"></i> Upload Files</h6>
+                                <form id="upload-form" enctype="multipart/form-data">
+                                    <div class="input-group input-group-sm">
+                                        <input type="file" class="form-control" id="file-upload" multiple>
+                                        <button class="btn btn-success" type="button" onclick="uploadFiles()">
+                                            <i class="bi bi-upload"></i> Upload
+                                        </button>
+                                    </div>
+                                </form>
+                                <div id="upload-progress" class="mt-2" style="display: none;">
+                                    <div class="progress" style="height: 20px;">
+                                        <div class="progress-bar progress-bar-striped progress-bar-animated" id="upload-progress-bar" style="width: 0%">0%</div>
+                                    </div>
+                                </div>
+                                <div id="upload-status" class="mt-2 small"></div>
+                                <div class="mt-2 d-flex gap-2">
+                                    <button class="btn btn-sm btn-outline-primary" onclick="createNewFile()">
+                                        <i class="bi bi-file-plus"></i> New File
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="createNewFolder()">
+                                        <i class="bi bi-folder-plus"></i> New Folder
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="file-list" id="file-list-container" style="max-height: 400px;">
                                 <table class="table table-sm">
                                     <thead>
                                         <tr>
                                             <th>Name</th>
                                             <th>Size</th>
+                                            <th>Modified</th>
                                             <th></th>
                                         </tr>
                                     </thead>
@@ -947,6 +1057,35 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="col-md-6">
                         <div class="stat-card">
+                            <h6 class="mb-3">
+                                <i class="bi bi-pencil-square"></i> File Editor
+                            </h6>
+                            <div class="mb-2">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">File:</span>
+                                    <input type="text" class="form-control" id="edit-file-path" placeholder="Select a file to edit" readonly>
+                                    <button class="btn btn-outline-primary" type="button" onclick="loadFileContent()">
+                                        <i class="bi bi-arrow-clockwise"></i> Reload
+                                    </button>
+                                </div>
+                            </div>
+                            <textarea id="file-editor" class="form-control" rows="18" style="font-family: monospace; font-size: 12px; resize: vertical;" placeholder="Select a file to edit its content..."></textarea>
+                            <div class="mt-2 d-flex justify-content-between">
+                                <small class="text-muted" id="editor-status">No file loaded</small>
+                                <div>
+                                    <button class="btn btn-sm btn-secondary" onclick="clearEditor()">
+                                        <i class="bi bi-x-circle"></i> Clear
+                                    </button>
+                                    <button class="btn btn-sm btn-primary" onclick="saveFileContent()">
+                                        <i class="bi bi-save"></i> Save
+                                    </button>
+                                    <button class="btn btn-sm btn-success" onclick="saveFileAs()">
+                                        <i class="bi bi-save2"></i> Save As
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="stat-card mt-3">
                             <h6 class="mb-3">
                                 <i class="bi bi-hdd-stack"></i> Disk Partitions
                             </h6>
@@ -1074,6 +1213,65 @@ HTML_TEMPLATE = """
                                 <i class="bi bi-hdd-stack"></i> Disk Usage Details
                             </h6>
                             <div id="disk-details-container"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Terminal Tab -->
+            <div class="tab-pane fade" id="terminal" role="tabpanel">
+                <div class="row mt-3">
+                    <div class="col-12">
+                        <div class="stat-card">
+                            <h6 class="mb-3">
+                                <i class="bi bi-terminal"></i> Interactive Terminal
+                                <span class="badge bg-success ms-2" id="terminal-status">Ready</span>
+                            </h6>
+                            <div class="mb-2 d-flex justify-content-between align-items-center">
+                                <div class="input-group input-group-sm" style="width: 300px;">
+                                    <span class="input-group-text">Shell:</span>
+                                    <select class="form-select" id="shell-select">
+                                        <option value="auto">Auto Detect</option>
+                                        <option value="/bin/bash">Bash</option>
+                                        <option value="/bin/zsh">Zsh</option>
+                                        <option value="/bin/sh">Sh</option>
+                                        <option value="cmd.exe">CMD (Windows)</option>
+                                        <option value="powershell.exe">PowerShell</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="clearTerminal()">
+                                        <i class="bi bi-trash"></i> Clear
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-warning" onclick="resetTerminal()">
+                                        <i class="bi bi-arrow-clockwise"></i> Reset
+                                    </button>
+                                </div>
+                            </div>
+                            <div id="terminal-container" class="terminal-output" style="background: #1e1e1e; color: #d4d4d4; font-family: 'Courier New', monospace; font-size: 13px; padding: 10px; border-radius: 5px; height: 400px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word;"></div>
+                            <div class="input-group mt-2">
+                                <span class="input-group-text" id="terminal-prompt" style="background: #1e1e1e; color: #4ec9b0; border-color: #3c3c3c; font-family: monospace;">$</span>
+                                <input type="text" class="form-control" id="terminal-input" placeholder="Type command and press Enter..." style="background: #1e1e1e; color: #d4d4d4; border-color: #3c3c3c; font-family: monospace;" autocomplete="off">
+                                <button class="btn btn-primary" type="button" onclick="executeCommand()">
+                                    <i class="bi bi-play-fill"></i> Run
+                                </button>
+                            </div>
+                            <div class="mt-2">
+                                <small class="text-muted">
+                                    <i class="bi bi-info-circle"></i> 
+                                    Press Enter to execute | Up/Down arrows for history | Ctrl+C to interrupt
+                                </small>
+                            </div>
+                            <div class="mt-2">
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('ls -la')" style="cursor: pointer;">ls -la</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('pwd')" style="cursor: pointer;">pwd</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('whoami')" style="cursor: pointer;">whoami</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('df -h')" style="cursor: pointer;">df -h</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('top -l 1 | head -20')" style="cursor: pointer;">top</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('ps aux | head -20')" style="cursor: pointer;">ps aux</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('netstat -an | head -20')" style="cursor: pointer;">netstat</span>
+                                <span class="badge bg-secondary me-1" onclick="quickCommand('uname -a')" style="cursor: pointer;">uname</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1721,6 +1919,478 @@ HTML_TEMPLATE = """
             }
             return size.toFixed(2) + ' ' + units[unitIndex];
         }
+        
+        // ==================== TERMINAL FUNCTIONS ====================
+        let commandHistory = [];
+        let historyIndex = -1;
+        let currentWorkingDir = '{{ cwd }}';
+        
+        // Initialize terminal input handlers
+        document.addEventListener('DOMContentLoaded', function() {
+            const terminalInput = document.getElementById('terminal-input');
+            if (terminalInput) {
+                terminalInput.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter') {
+                        executeCommand();
+                    } else if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        navigateHistory(-1);
+                    } else if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        navigateHistory(1);
+                    } else if (e.key === 'c' && e.ctrlKey) {
+                        appendToTerminal('^C', 'terminal-error');
+                        terminalInput.value = '';
+                    }
+                });
+            }
+            // Initialize with welcome message
+            appendToTerminal('Welcome to CasMonitor Terminal', 'terminal-info');
+            appendToTerminal('Type commands below and press Enter to execute.', 'terminal-info');
+            appendToTerminal('-------------------------------------------', 'terminal-info');
+            updateTerminalPrompt();
+        });
+        
+        function executeCommand() {
+            const input = document.getElementById('terminal-input');
+            const command = input.value.trim();
+            if (!command) return;
+            
+            // Add to history
+            commandHistory.push(command);
+            historyIndex = commandHistory.length;
+            
+            // Display command
+            const prompt = document.getElementById('terminal-prompt').textContent;
+            appendToTerminal(prompt + ' ' + command, 'terminal-command');
+            
+            // Clear input
+            input.value = '';
+            
+            // Update status
+            document.getElementById('terminal-status').textContent = 'Running...';
+            document.getElementById('terminal-status').className = 'badge bg-warning ms-2';
+            
+            // Get selected shell
+            const shellSelect = document.getElementById('shell-select');
+            const shell = shellSelect.value;
+            
+            // Execute command via API
+            fetch('/api/terminal/execute', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    command: command,
+                    cwd: currentWorkingDir,
+                    shell: shell
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.stdout) {
+                    appendToTerminal(data.stdout, 'terminal-output-text');
+                }
+                if (data.stderr) {
+                    appendToTerminal(data.stderr, 'terminal-error');
+                }
+                if (data.cwd) {
+                    currentWorkingDir = data.cwd;
+                    updateTerminalPrompt();
+                }
+                if (data.error) {
+                    appendToTerminal('Error: ' + data.error, 'terminal-error');
+                }
+                document.getElementById('terminal-status').textContent = 'Ready';
+                document.getElementById('terminal-status').className = 'badge bg-success ms-2';
+            })
+            .catch(error => {
+                appendToTerminal('Error: ' + error.message, 'terminal-error');
+                document.getElementById('terminal-status').textContent = 'Error';
+                document.getElementById('terminal-status').className = 'badge bg-danger ms-2';
+            });
+        }
+        
+        function appendToTerminal(text, className) {
+            const container = document.getElementById('terminal-container');
+            const line = document.createElement('div');
+            line.className = className || '';
+            line.textContent = text;
+            container.appendChild(line);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        function clearTerminal() {
+            document.getElementById('terminal-container').innerHTML = '';
+            appendToTerminal('Terminal cleared.', 'terminal-info');
+        }
+        
+        function resetTerminal() {
+            currentWorkingDir = '/';
+            commandHistory = [];
+            historyIndex = -1;
+            clearTerminal();
+            appendToTerminal('Terminal reset. Working directory: /', 'terminal-info');
+            updateTerminalPrompt();
+        }
+        
+        function updateTerminalPrompt() {
+            const prompt = document.getElementById('terminal-prompt');
+            const shortPath = currentWorkingDir.length > 30 ? 
+                '...' + currentWorkingDir.slice(-27) : currentWorkingDir;
+            prompt.textContent = shortPath + ' $';
+        }
+        
+        function navigateHistory(direction) {
+            if (commandHistory.length === 0) return;
+            
+            historyIndex += direction;
+            if (historyIndex < 0) historyIndex = 0;
+            if (historyIndex >= commandHistory.length) {
+                historyIndex = commandHistory.length;
+                document.getElementById('terminal-input').value = '';
+                return;
+            }
+            document.getElementById('terminal-input').value = commandHistory[historyIndex];
+        }
+        
+        function quickCommand(cmd) {
+            document.getElementById('terminal-input').value = cmd;
+            executeCommand();
+        }
+        
+        // ==================== FILE UPLOAD FUNCTIONS ====================
+        function uploadFiles() {
+            const fileInput = document.getElementById('file-upload');
+            const files = fileInput.files;
+            if (files.length === 0) {
+                document.getElementById('upload-status').innerHTML = 
+                    '<span class="text-warning">Please select files to upload.</span>';
+                return;
+            }
+            
+            const uploadPath = document.getElementById('current-path').value;
+            const formData = new FormData();
+            for (let i = 0; i < files.length; i++) {
+                formData.append('files', files[i]);
+            }
+            formData.append('path', uploadPath);
+            
+            // Show progress
+            document.getElementById('upload-progress').style.display = 'block';
+            document.getElementById('upload-status').innerHTML = 
+                '<span class="text-info">Uploading...</span>';
+            
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload', true);
+            
+            xhr.upload.onprogress = function(e) {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    document.getElementById('upload-progress-bar').style.width = percent + '%';
+                    document.getElementById('upload-progress-bar').textContent = percent + '%';
+                }
+            };
+            
+            xhr.onload = function() {
+                if (xhr.status === 200) {
+                    const response = JSON.parse(xhr.responseText);
+                    if (response.status === 'success') {
+                        document.getElementById('upload-status').innerHTML = 
+                            '<span class="text-success"><i class="bi bi-check-circle"></i> ' + 
+                            response.uploaded.length + ' file(s) uploaded successfully!</span>';
+                        updateFileList();
+                    } else {
+                        document.getElementById('upload-status').innerHTML = 
+                            '<span class="text-danger"><i class="bi bi-x-circle"></i> ' + 
+                            response.message + '</span>';
+                    }
+                } else {
+                    document.getElementById('upload-status').innerHTML = 
+                        '<span class="text-danger">Upload failed!</span>';
+                }
+                setTimeout(() => {
+                    document.getElementById('upload-progress').style.display = 'none';
+                    document.getElementById('upload-progress-bar').style.width = '0%';
+                }, 2000);
+            };
+            
+            xhr.onerror = function() {
+                document.getElementById('upload-status').innerHTML = 
+                    '<span class="text-danger">Upload error!</span>';
+            };
+            
+            xhr.send(formData);
+            fileInput.value = '';
+        }
+        
+        // ==================== FILE EDITOR FUNCTIONS ====================
+        let currentEditFile = null;
+        let originalContent = '';
+        
+        function editFile(filePath) {
+            currentEditFile = filePath;
+            document.getElementById('edit-file-path').value = filePath;
+            loadFileContent();
+        }
+        
+        function loadFileContent() {
+            const filePath = document.getElementById('edit-file-path').value;
+            if (!filePath) {
+                document.getElementById('editor-status').textContent = 'No file selected';
+                return;
+            }
+            
+            document.getElementById('editor-status').textContent = 'Loading...';
+            
+            fetch('/api/file/read?path=' + encodeURIComponent(filePath))
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        document.getElementById('file-editor').value = data.content;
+                        originalContent = data.content;
+                        currentEditFile = filePath;
+                        const lines = data.content.split('\\n').length;
+                        const size = new Blob([data.content]).size;
+                        document.getElementById('editor-status').textContent = 
+                            `Loaded: ${lines} lines, ${humanizeSize(size)}`;
+                    } else {
+                        document.getElementById('editor-status').textContent = 'Error: ' + data.message;
+                        document.getElementById('file-editor').value = '';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('editor-status').textContent = 'Error loading file';
+                    console.error('Error:', error);
+                });
+        }
+        
+        function saveFileContent() {
+            const filePath = document.getElementById('edit-file-path').value;
+            const content = document.getElementById('file-editor').value;
+            
+            if (!filePath) {
+                alert('No file selected. Use "Save As" to create a new file.');
+                return;
+            }
+            
+            document.getElementById('editor-status').textContent = 'Saving...';
+            
+            fetch('/api/file/write', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    path: filePath,
+                    content: content
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    originalContent = content;
+                    document.getElementById('editor-status').textContent = 
+                        'Saved successfully at ' + new Date().toLocaleTimeString();
+                    updateFileList();
+                } else {
+                    document.getElementById('editor-status').textContent = 'Error: ' + data.message;
+                }
+            })
+            .catch(error => {
+                document.getElementById('editor-status').textContent = 'Error saving file';
+                console.error('Error:', error);
+            });
+        }
+        
+        function saveFileAs() {
+            const content = document.getElementById('file-editor').value;
+            const currentPath = document.getElementById('current-path').value;
+            const fileName = prompt('Enter file name:', 'newfile.txt');
+            
+            if (!fileName) return;
+            
+            const fullPath = currentPath.endsWith('/') ? 
+                currentPath + fileName : currentPath + '/' + fileName;
+            
+            fetch('/api/file/write', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    path: fullPath,
+                    content: content
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    document.getElementById('edit-file-path').value = fullPath;
+                    currentEditFile = fullPath;
+                    originalContent = content;
+                    document.getElementById('editor-status').textContent = 
+                        'Saved as ' + fileName + ' at ' + new Date().toLocaleTimeString();
+                    updateFileList();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(error => {
+                alert('Error saving file');
+                console.error('Error:', error);
+            });
+        }
+        
+        function clearEditor() {
+            if (document.getElementById('file-editor').value !== originalContent) {
+                if (!confirm('You have unsaved changes. Clear anyway?')) return;
+            }
+            document.getElementById('file-editor').value = '';
+            document.getElementById('edit-file-path').value = '';
+            currentEditFile = null;
+            originalContent = '';
+            document.getElementById('editor-status').textContent = 'Editor cleared';
+        }
+        
+        function goUpDirectory() {
+            const currentPath = document.getElementById('current-path').value;
+            const parentPath = currentPath.split('/').slice(0, -1).join('/') || '/';
+            document.getElementById('current-path').value = parentPath;
+            updateFileList();
+        }
+        
+        function goToHome() {
+            fetch('/api/home_dir')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('current-path').value = data.home;
+                    updateFileList();
+                });
+        }
+        
+        // Override updateFileList to add edit button
+        const originalUpdateFileList = updateFileList;
+        updateFileList = function() {
+            const path = document.getElementById('current-path').value;
+            fetch('/api/files?path=' + encodeURIComponent(path))
+                .then(response => response.json())
+                .then(files => {
+                    const tbody = document.getElementById('file-list');
+                    tbody.innerHTML = files.map(file => `
+                        <tr>
+                            <td>
+                                <i class="bi bi-${file.type === 'directory' ? 'folder-fill text-warning' : 'file-text text-secondary'}"></i>
+                                <span style="cursor: pointer;" onclick="${file.type === 'directory' ? `navigateToDirectory('${file.path.replace(/'/g, "\\'")}')` : `editFile('${file.path.replace(/'/g, "\\'")}')`}">
+                                    ${file.name}
+                                </span>
+                            </td>
+                            <td>${file.size}</td>
+                            <td><small class="text-muted">${file.modified}</small></td>
+                            <td>
+                                ${file.type === 'directory' ? 
+                                    `<button class="btn btn-sm btn-outline-primary file-action-btn" 
+                                             onclick="navigateToDirectory('${file.path.replace(/'/g, "\\'")}')">
+                                        <i class="bi bi-folder-symlink"></i>
+                                    </button>` : 
+                                    `<button class="btn btn-sm btn-outline-info file-action-btn" 
+                                             onclick="editFile('${file.path.replace(/'/g, "\\'")}')">
+                                        <i class="bi bi-pencil"></i>
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-warning file-action-btn" 
+                                             onclick="renameFile('${file.path.replace(/'/g, "\\'")}')">
+                                        <i class="bi bi-pencil-square"></i>
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-success file-action-btn" 
+                                             onclick="downloadFile('${file.path.replace(/'/g, "\\'")}')">
+                                        <i class="bi bi-download"></i>
+                                    </button>`}
+                                <button class="btn btn-sm btn-outline-danger file-action-btn" 
+                                        onclick="deleteFile('${file.path.replace(/'/g, "\\'")}')">
+                                    <i class="bi bi-trash"></i>
+                                </button>
+                            </td>
+                        </tr>
+                    `).join('');
+                })
+                .catch(error => {
+                    console.error('Error updating file list:', error);
+                });
+        };
+        
+        function downloadFile(filePath) {
+            window.open('/api/file/download?path=' + encodeURIComponent(filePath), '_blank');
+        }
+        
+        function createNewFile() {
+            const currentPath = document.getElementById('current-path').value;
+            const fileName = prompt('Enter new file name:', 'newfile.txt');
+            if (!fileName) return;
+            
+            const fullPath = currentPath.endsWith('/') ? 
+                currentPath + fileName : currentPath + '/' + fileName;
+            
+            fetch('/api/file/write', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    path: fullPath,
+                    content: ''
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateFileList();
+                    editFile(fullPath);
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function createNewFolder() {
+            const currentPath = document.getElementById('current-path').value;
+            const folderName = prompt('Enter new folder name:', 'newfolder');
+            if (!folderName) return;
+            
+            const fullPath = currentPath.endsWith('/') ? 
+                currentPath + folderName : currentPath + '/' + folderName;
+            
+            fetch('/api/folder/create', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: fullPath})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateFileList();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function renameFile(filePath) {
+            const oldName = filePath.split('/').pop();
+            const newName = prompt('Enter new name:', oldName);
+            if (!newName || newName === oldName) return;
+            
+            const newPath = filePath.replace(oldName, newName);
+            
+            fetch('/api/file/rename', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    oldPath: filePath,
+                    newPath: newPath
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    updateFileList();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
     </script>
 </body>
 </html>
@@ -1729,7 +2399,7 @@ HTML_TEMPLATE = """
 # Routes
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, refresh_interval=REFRESH_INTERVAL)
+    return render_template_string(HTML_TEMPLATE, refresh_interval=REFRESH_INTERVAL, cwd=os.getcwd())
 
 @app.route('/api/system_info')
 def system_info():
@@ -1818,6 +2488,314 @@ def get_performance_history():
 @app.route('/api/resources')
 def get_resources():
     return jsonify(get_system_resources())
+
+# ==================== TERMINAL API ====================
+@app.route('/api/terminal/execute', methods=['POST'])
+def terminal_execute():
+    """Execute a terminal command and return output"""
+    try:
+        data = request.json
+        command = data.get('command', '')
+        cwd = data.get('cwd', os.getcwd())
+        shell_type = data.get('shell', 'auto')
+        
+        if not command:
+            return jsonify({'error': 'No command provided'})
+        
+        # Validate and set working directory
+        if not os.path.isdir(cwd):
+            cwd = os.getcwd()
+        
+        # Handle cd command specially
+        if command.strip().startswith('cd '):
+            new_dir = command.strip()[3:].strip()
+            if new_dir == '~':
+                new_dir = os.path.expanduser('~')
+            elif new_dir == '-':
+                new_dir = cwd
+            elif not os.path.isabs(new_dir):
+                new_dir = os.path.join(cwd, new_dir)
+            
+            new_dir = os.path.normpath(new_dir)
+            
+            if os.path.isdir(new_dir):
+                return jsonify({
+                    'stdout': '',
+                    'stderr': '',
+                    'cwd': new_dir,
+                    'returncode': 0
+                })
+            else:
+                return jsonify({
+                    'stdout': '',
+                    'stderr': f'cd: no such file or directory: {new_dir}',
+                    'cwd': cwd,
+                    'returncode': 1
+                })
+        
+        # Determine shell
+        if shell_type == 'auto':
+            if platform.system() == 'Windows':
+                shell_cmd = ['cmd.exe', '/c']
+            else:
+                shell_cmd = ['/bin/bash', '-c']
+        elif shell_type in ['cmd.exe', 'powershell.exe']:
+            if shell_type == 'cmd.exe':
+                shell_cmd = ['cmd.exe', '/c']
+            else:
+                shell_cmd = ['powershell.exe', '-Command']
+        else:
+            shell_cmd = [shell_type, '-c']
+        
+        # Execute command
+        try:
+            result = subprocess.run(
+                shell_cmd + [command],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, 'TERM': 'xterm-256color'}
+            )
+            
+            return jsonify({
+                'stdout': result.stdout,
+                'stderr': result.stderr,
+                'cwd': cwd,
+                'returncode': result.returncode
+            })
+        except subprocess.TimeoutExpired:
+            return jsonify({
+                'stdout': '',
+                'stderr': 'Command timed out after 60 seconds',
+                'cwd': cwd,
+                'returncode': -1
+            })
+        except FileNotFoundError as e:
+            return jsonify({
+                'stdout': '',
+                'stderr': f'Command not found: {str(e)}',
+                'cwd': cwd,
+                'returncode': 127
+            })
+            
+    except Exception as e:
+        log_system_event('error', f'Terminal execution error: {str(e)}')
+        return jsonify({'error': str(e)})
+
+# ==================== FILE UPLOAD API ====================
+@app.route('/api/upload', methods=['POST'])
+def upload_files():
+    """Handle file uploads"""
+    try:
+        if 'files' not in request.files:
+            return jsonify({'status': 'error', 'message': 'No files provided'})
+        
+        files = request.files.getlist('files')
+        upload_path = request.form.get('path', os.getcwd())
+        
+        # Validate upload path
+        if not os.path.isdir(upload_path):
+            upload_path = os.getcwd()
+        
+        uploaded = []
+        errors = []
+        
+        for file in files:
+            if file.filename == '':
+                continue
+            
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                # If secure_filename returns empty, use original with basic sanitization
+                if not filename:
+                    filename = file.filename.replace('/', '_').replace('\\', '_')
+                
+                filepath = os.path.join(upload_path, filename)
+                
+                # Handle duplicate filenames
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(filepath):
+                    filename = f"{base}_{counter}{ext}"
+                    filepath = os.path.join(upload_path, filename)
+                    counter += 1
+                
+                file.save(filepath)
+                uploaded.append(filename)
+                log_system_event('info', f'Uploaded file: {filepath}')
+            else:
+                errors.append(f'{file.filename} - file type not allowed')
+        
+        if uploaded:
+            return jsonify({
+                'status': 'success',
+                'uploaded': uploaded,
+                'errors': errors
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': 'No files were uploaded',
+                'errors': errors
+            })
+            
+    except Exception as e:
+        log_system_event('error', f'Upload error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+# ==================== FILE READ/WRITE API ====================
+@app.route('/api/file/read')
+def read_file():
+    """Read file content"""
+    try:
+        file_path = request.args.get('path', '')
+        
+        if not file_path:
+            return jsonify({'status': 'error', 'message': 'No file path provided'})
+        
+        if not os.path.isfile(file_path):
+            return jsonify({'status': 'error', 'message': 'File not found'})
+        
+        # Check file size (limit to 10MB for reading)
+        file_size = os.path.getsize(file_path)
+        if file_size > 10 * 1024 * 1024:
+            return jsonify({'status': 'error', 'message': 'File too large (max 10MB)'})
+        
+        # Try to read as text
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            # Try with latin-1 encoding
+            try:
+                with open(file_path, 'r', encoding='latin-1') as f:
+                    content = f.read()
+            except:
+                return jsonify({'status': 'error', 'message': 'Cannot read binary file'})
+        
+        return jsonify({
+            'status': 'success',
+            'content': content,
+            'size': file_size,
+            'path': file_path
+        })
+        
+    except PermissionError:
+        return jsonify({'status': 'error', 'message': 'Permission denied'})
+    except Exception as e:
+        log_system_event('error', f'File read error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/file/write', methods=['POST'])
+def write_file():
+    """Write content to file"""
+    try:
+        data = request.json
+        file_path = data.get('path', '')
+        content = data.get('content', '')
+        
+        if not file_path:
+            return jsonify({'status': 'error', 'message': 'No file path provided'})
+        
+        # Create directory if it doesn't exist
+        dir_path = os.path.dirname(file_path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        log_system_event('info', f'File saved: {file_path}')
+        
+        return jsonify({
+            'status': 'success',
+            'path': file_path,
+            'size': len(content)
+        })
+        
+    except PermissionError:
+        return jsonify({'status': 'error', 'message': 'Permission denied'})
+    except Exception as e:
+        log_system_event('error', f'File write error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/home_dir')
+def get_home_dir():
+    """Get home directory path"""
+    return jsonify({'home': os.path.expanduser('~')})
+
+@app.route('/api/folder/create', methods=['POST'])
+def create_folder():
+    """Create a new folder"""
+    try:
+        data = request.json
+        folder_path = data.get('path', '')
+        
+        if not folder_path:
+            return jsonify({'status': 'error', 'message': 'No folder path provided'})
+        
+        os.makedirs(folder_path, exist_ok=True)
+        log_system_event('info', f'Created folder: {folder_path}')
+        
+        return jsonify({'status': 'success', 'path': folder_path})
+        
+    except PermissionError:
+        return jsonify({'status': 'error', 'message': 'Permission denied'})
+    except Exception as e:
+        log_system_event('error', f'Folder creation error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/file/rename', methods=['POST'])
+def rename_file():
+    """Rename a file or folder"""
+    try:
+        data = request.json
+        old_path = data.get('oldPath', '')
+        new_path = data.get('newPath', '')
+        
+        if not old_path or not new_path:
+            return jsonify({'status': 'error', 'message': 'Invalid paths provided'})
+        
+        if not os.path.exists(old_path):
+            return jsonify({'status': 'error', 'message': 'Source file not found'})
+        
+        if os.path.exists(new_path):
+            return jsonify({'status': 'error', 'message': 'Destination already exists'})
+        
+        os.rename(old_path, new_path)
+        log_system_event('info', f'Renamed: {old_path} -> {new_path}')
+        
+        return jsonify({'status': 'success', 'oldPath': old_path, 'newPath': new_path})
+        
+    except PermissionError:
+        return jsonify({'status': 'error', 'message': 'Permission denied'})
+    except Exception as e:
+        log_system_event('error', f'Rename error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/file/download')
+def download_file():
+    """Download a file"""
+    try:
+        from flask import send_file
+        file_path = request.args.get('path', '')
+        
+        if not file_path:
+            return jsonify({'status': 'error', 'message': 'No file path provided'})
+        
+        if not os.path.isfile(file_path):
+            return jsonify({'status': 'error', 'message': 'File not found'})
+        
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=os.path.basename(file_path)
+        )
+        
+    except Exception as e:
+        log_system_event('error', f'File download error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
 
 # Graceful shutdown handler
 def signal_handler(sig, frame):
