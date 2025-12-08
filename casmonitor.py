@@ -38,7 +38,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS or '.' not in filename
 
 # Configuration
-REFRESH_INTERVAL = 3000  # milliseconds
+REFRESH_INTERVAL = 1000  # milliseconds - faster updates for real-time monitoring
 MAX_LOG_ENTRIES = 100
 SYSTEM_LOG = []
 MONITORING_INTERVAL = 1000  # milliseconds
@@ -767,6 +767,18 @@ HTML_TEMPLATE = """
             padding: 2px 6px;
             font-size: 11px;
         }
+        /* Blinking animation for running status */
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0.5; }
+        }
+        .blink {
+            animation: blink 1s infinite;
+        }
+        /* Running indicator */
+        .terminal-running {
+            border: 2px solid #ffc107 !important;
+        }
     </style>
 </head>
 <body>
@@ -921,6 +933,11 @@ HTML_TEMPLATE = """
             </li>
             <li class="nav-item" role="presentation">
                 <button class="nav-link" id="terminal-tab" data-bs-toggle="tab" data-bs-target="#terminal" type="button" role="tab">Terminal</button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="docker-tab" data-bs-toggle="tab" data-bs-target="#docker" type="button" role="tab">
+                    <i class="bi bi-box-seam"></i> Docker
+                </button>
             </li>
         </ul>
         <div class="tab-content" id="systemTabContent">
@@ -1240,6 +1257,9 @@ HTML_TEMPLATE = """
                                     </select>
                                 </div>
                                 <div>
+                                    <button class="btn btn-sm btn-outline-danger" id="stop-btn" onclick="stopCommand()" style="display: none;">
+                                        <i class="bi bi-stop-fill"></i> Stop
+                                    </button>
                                     <button class="btn btn-sm btn-outline-secondary" onclick="clearTerminal()">
                                         <i class="bi bi-trash"></i> Clear
                                     </button>
@@ -1252,7 +1272,7 @@ HTML_TEMPLATE = """
                             <div class="input-group mt-2">
                                 <span class="input-group-text" id="terminal-prompt" style="background: #1e1e1e; color: #4ec9b0; border-color: #3c3c3c; font-family: monospace;">$</span>
                                 <input type="text" class="form-control" id="terminal-input" placeholder="Type command and press Enter..." style="background: #1e1e1e; color: #d4d4d4; border-color: #3c3c3c; font-family: monospace;" autocomplete="off">
-                                <button class="btn btn-primary" type="button" onclick="executeCommand()">
+                                <button class="btn btn-primary" type="button" id="run-btn" onclick="executeCommand()">
                                     <i class="bi bi-play-fill"></i> Run
                                 </button>
                             </div>
@@ -1276,6 +1296,139 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             </div>
+            
+            <!-- Docker Tab -->
+            <div class="tab-pane fade" id="docker" role="tabpanel">
+                <div class="row mt-3">
+                    <!-- Docker Status -->
+                    <div class="col-12 mb-3">
+                        <div class="stat-card">
+                            <div class="d-flex justify-content-between align-items-center">
+                                <h6 class="mb-0">
+                                    <i class="bi bi-box-seam"></i> Docker Status
+                                    <span class="badge bg-secondary ms-2" id="docker-status">Checking...</span>
+                                </h6>
+                                <div>
+                                    <button class="btn btn-sm btn-outline-primary" onclick="refreshDocker()">
+                                        <i class="bi bi-arrow-clockwise"></i> Refresh
+                                    </button>
+                                    <button class="btn btn-sm btn-success" onclick="showCreateContainerModal()">
+                                        <i class="bi bi-plus-circle"></i> Create Container
+                                    </button>
+                                    <button class="btn btn-sm btn-info" onclick="showPullImageModal()">
+                                        <i class="bi bi-cloud-download"></i> Pull Image
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="row mt-3" id="docker-stats-row">
+                                <div class="col-md-3">
+                                    <div class="text-center">
+                                        <h4 id="docker-containers-total">0</h4>
+                                        <small class="text-muted">Total Containers</small>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="text-center">
+                                        <h4 id="docker-containers-running" class="text-success">0</h4>
+                                        <small class="text-muted">Running</small>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="text-center">
+                                        <h4 id="docker-containers-stopped" class="text-warning">0</h4>
+                                        <small class="text-muted">Stopped</small>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="text-center">
+                                        <h4 id="docker-images-total">0</h4>
+                                        <small class="text-muted">Images</small>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Containers List -->
+                    <div class="col-md-8">
+                        <div class="stat-card">
+                            <h6 class="mb-3">
+                                <i class="bi bi-box"></i> Containers
+                            </h6>
+                            <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                                <table class="table table-sm table-hover">
+                                    <thead class="sticky-top bg-body">
+                                        <tr>
+                                            <th>Name</th>
+                                            <th>Image</th>
+                                            <th>Status</th>
+                                            <th>Ports</th>
+                                            <th>CPU</th>
+                                            <th>Memory</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="docker-containers-list">
+                                        <tr><td colspan="7" class="text-center text-muted">Loading...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Images List -->
+                    <div class="col-md-4">
+                        <div class="stat-card">
+                            <h6 class="mb-3">
+                                <i class="bi bi-layers"></i> Images
+                            </h6>
+                            <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                                <table class="table table-sm table-hover">
+                                    <thead class="sticky-top bg-body">
+                                        <tr>
+                                            <th>Repository</th>
+                                            <th>Tag</th>
+                                            <th>Size</th>
+                                            <th></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="docker-images-list">
+                                        <tr><td colspan="4" class="text-center text-muted">Loading...</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Container Logs -->
+                <div class="row mt-3">
+                    <div class="col-12">
+                        <div class="stat-card">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <h6 class="mb-0">
+                                    <i class="bi bi-terminal"></i> Container Logs
+                                    <span class="badge bg-secondary ms-2" id="logs-container-name">Select a container</span>
+                                </h6>
+                                <div>
+                                    <select class="form-select form-select-sm d-inline-block" style="width: auto;" id="logs-lines-select">
+                                        <option value="50">Last 50 lines</option>
+                                        <option value="100" selected>Last 100 lines</option>
+                                        <option value="500">Last 500 lines</option>
+                                        <option value="1000">Last 1000 lines</option>
+                                    </select>
+                                    <button class="btn btn-sm btn-outline-secondary" onclick="clearContainerLogs()">
+                                        <i class="bi bi-trash"></i> Clear
+                                    </button>
+                                </div>
+                            </div>
+                            <div id="container-logs" class="terminal-output" style="background: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap;">
+                                Select a container to view logs...
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -1283,6 +1436,169 @@ HTML_TEMPLATE = """
     <button class="btn btn-primary theme-toggle" onclick="toggleTheme()">
         <i class="bi bi-moon-stars-fill" id="theme-icon"></i>
     </button>
+    
+    <!-- Create Container Modal -->
+    <div class="modal fade" id="createContainerModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-success text-white">
+                    <h5 class="modal-title"><i class="bi bi-plus-circle"></i> Create Container</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="create-container-form">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Container Name</label>
+                                <input type="text" class="form-control" id="container-name" placeholder="my-container">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Image *</label>
+                                <input type="text" class="form-control" id="container-image" placeholder="nginx:latest" required>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Port Mapping</label>
+                                <input type="text" class="form-control" id="container-ports" placeholder="8080:80, 443:443">
+                                <small class="text-muted">Format: host:container (comma separated)</small>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Volume Mapping</label>
+                                <input type="text" class="form-control" id="container-volumes" placeholder="/host/path:/container/path">
+                                <small class="text-muted">Format: host:container (comma separated)</small>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-12 mb-3">
+                                <label class="form-label">Environment Variables</label>
+                                <textarea class="form-control" id="container-env" rows="2" placeholder="KEY1=value1&#10;KEY2=value2"></textarea>
+                                <small class="text-muted">One per line: KEY=value</small>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Command (optional)</label>
+                                <input type="text" class="form-control" id="container-command" placeholder="/bin/bash">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Network</label>
+                                <select class="form-select" id="container-network">
+                                    <option value="">Default (bridge)</option>
+                                    <option value="host">Host</option>
+                                    <option value="none">None</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Restart Policy</label>
+                                <select class="form-select" id="container-restart">
+                                    <option value="">No</option>
+                                    <option value="always">Always</option>
+                                    <option value="unless-stopped">Unless Stopped</option>
+                                    <option value="on-failure">On Failure</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Options</label>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="container-detach" checked>
+                                    <label class="form-check-label" for="container-detach">Run in background (detached)</label>
+                                </div>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="container-rm">
+                                    <label class="form-check-label" for="container-rm">Remove when stopped</label>
+                                </div>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="create-container-output" class="mt-3" style="display: none;">
+                        <div class="alert" id="create-container-alert"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-success" onclick="createContainer()">
+                        <i class="bi bi-play-fill"></i> Create & Start
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Pull Image Modal -->
+    <div class="modal fade" id="pullImageModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header bg-info text-white">
+                    <h5 class="modal-title"><i class="bi bi-cloud-download"></i> Pull Image</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Image Name</label>
+                        <input type="text" class="form-control" id="pull-image-name" placeholder="nginx:latest">
+                        <small class="text-muted">Examples: ubuntu, nginx:alpine, mysql:8.0</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Popular Images</label>
+                        <div class="d-flex flex-wrap gap-1">
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('nginx:latest')">nginx</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('ubuntu:latest')">ubuntu</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('alpine:latest')">alpine</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('mysql:8.0')">mysql</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('postgres:latest')">postgres</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('redis:latest')">redis</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('mongo:latest')">mongo</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('node:lts')">node</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('python:3.11')">python</span>
+                            <span class="badge bg-secondary" style="cursor: pointer;" onclick="setPullImage('httpd:latest')">httpd</span>
+                        </div>
+                    </div>
+                    <div id="pull-image-progress" style="display: none;">
+                        <div class="progress mb-2">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated" id="pull-progress-bar" style="width: 0%"></div>
+                        </div>
+                        <div id="pull-image-status" class="small text-muted"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-info" id="pull-image-btn" onclick="pullImage()">
+                        <i class="bi bi-cloud-download"></i> Pull
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Container Exec Modal -->
+    <div class="modal fade" id="execModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title"><i class="bi bi-terminal"></i> Execute in Container: <span id="exec-container-name"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Command</label>
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="exec-command" placeholder="ls -la" value="sh">
+                            <button class="btn btn-primary" onclick="execInContainer()">
+                                <i class="bi bi-play-fill"></i> Execute
+                            </button>
+                        </div>
+                        <small class="text-muted">Common: sh, bash, ls -la, cat /etc/os-release</small>
+                    </div>
+                    <div id="exec-output" class="terminal-output" style="background: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 12px; padding: 10px; border-radius: 5px; height: 300px; overflow-y: auto; white-space: pre-wrap;">
+                        Output will appear here...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
     
     <!-- Delete Modal -->
     <div class="modal fade" id="deleteModal" tabindex="-1">
@@ -1347,13 +1663,13 @@ HTML_TEMPLATE = """
             updateSystemInfoTab();
             updateResourcesTab();
             updateDiskTab();
-            setInterval(updateSystemInfo, {{ refresh_interval }});
-            setInterval(updateProcesses, 5000);
-            setInterval(updateSystemLog, 2000);
-            setInterval(updateCurrentTime, 1000);
-            setInterval(updatePerformanceHistory, 10000);
-            setInterval(updateResourcesTab, 10000);
-            setInterval(updateDiskTab, 30000);
+            setInterval(updateSystemInfo, {{ refresh_interval }});  // 1 second
+            setInterval(updateProcesses, 2000);  // 2 seconds - more frequent process updates
+            setInterval(updateSystemLog, 1000);  // 1 second - real-time logs
+            setInterval(updateCurrentTime, 1000);  // 1 second
+            setInterval(updatePerformanceHistory, 3000);  // 3 seconds - faster chart updates
+            setInterval(updateResourcesTab, 3000);  // 3 seconds
+            setInterval(updateDiskTab, 10000);  // 10 seconds - disk doesn't change often
         });
         
         function updateCurrentTime() {
@@ -1939,8 +2255,14 @@ HTML_TEMPLATE = """
                         e.preventDefault();
                         navigateHistory(1);
                     } else if (e.key === 'c' && e.ctrlKey) {
-                        appendToTerminal('^C', 'terminal-error');
-                        terminalInput.value = '';
+                        e.preventDefault();
+                        if (isCommandRunning) {
+                            appendToTerminal('^C - Attempting to cancel...', 'terminal-error');
+                            // Note: Server-side cancellation would need additional implementation
+                            setTerminalLocked(false);
+                        } else {
+                            terminalInput.value = '';
+                        }
                     }
                 });
             }
@@ -1951,10 +2273,19 @@ HTML_TEMPLATE = """
             updateTerminalPrompt();
         });
         
+        let isCommandRunning = false;
+        let currentEventSource = null;
+        
         function executeCommand() {
             const input = document.getElementById('terminal-input');
             const command = input.value.trim();
             if (!command) return;
+            
+            // Block if command is already running
+            if (isCommandRunning) {
+                appendToTerminal('⚠ Please wait for the current command to finish...', 'terminal-error');
+                return;
+            }
             
             // Add to history
             commandHistory.push(command);
@@ -1964,18 +2295,59 @@ HTML_TEMPLATE = """
             const prompt = document.getElementById('terminal-prompt').textContent;
             appendToTerminal(prompt + ' ' + command, 'terminal-command');
             
-            // Clear input
+            // Clear input and disable
             input.value = '';
-            
-            // Update status
-            document.getElementById('terminal-status').textContent = 'Running...';
-            document.getElementById('terminal-status').className = 'badge bg-warning ms-2';
+            setTerminalLocked(true);
             
             // Get selected shell
             const shellSelect = document.getElementById('shell-select');
             const shell = shellSelect.value;
             
-            // Execute command via API
+            // Check if command needs streaming (long-running commands)
+            const streamingCommands = ['apt', 'brew', 'npm', 'pip', 'yarn', 'git', 'wget', 'curl', 'make', 'cmake', 'cargo', 'go', 'docker', 'kubectl', 'terraform', 'ansible'];
+            const needsStreaming = streamingCommands.some(cmd => command.trim().startsWith(cmd + ' ') || command.trim() === cmd);
+            
+            if (needsStreaming) {
+                executeStreamingCommand(command, shell);
+            } else {
+                executeNormalCommand(command, shell);
+            }
+        }
+        
+        function setTerminalLocked(locked) {
+            isCommandRunning = locked;
+            const input = document.getElementById('terminal-input');
+            const runBtn = document.getElementById('run-btn');
+            const stopBtn = document.getElementById('stop-btn');
+            
+            if (locked) {
+                input.disabled = true;
+                input.placeholder = 'Command running... please wait';
+                input.style.opacity = '0.6';
+                if (runBtn) runBtn.disabled = true;
+                if (stopBtn) stopBtn.style.display = 'inline-block';
+                document.getElementById('terminal-status').textContent = 'Running...';
+                document.getElementById('terminal-status').className = 'badge bg-warning ms-2 blink';
+            } else {
+                input.disabled = false;
+                input.placeholder = 'Type command and press Enter...';
+                input.style.opacity = '1';
+                if (runBtn) runBtn.disabled = false;
+                if (stopBtn) stopBtn.style.display = 'none';
+                document.getElementById('terminal-status').textContent = 'Ready';
+                document.getElementById('terminal-status').className = 'badge bg-success ms-2';
+                input.focus();
+            }
+        }
+        
+        function stopCommand() {
+            if (isCommandRunning) {
+                appendToTerminal('^C - Command cancelled by user', 'terminal-error');
+                setTerminalLocked(false);
+            }
+        }
+        
+        function executeNormalCommand(command, shell) {
             fetch('/api/terminal/execute', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -1988,10 +2360,15 @@ HTML_TEMPLATE = """
             .then(response => response.json())
             .then(data => {
                 if (data.stdout) {
-                    appendToTerminal(data.stdout, 'terminal-output-text');
+                    // Split output into lines for better display
+                    data.stdout.split('\\n').forEach(line => {
+                        if (line) appendToTerminal(line, 'terminal-output-text');
+                    });
                 }
                 if (data.stderr) {
-                    appendToTerminal(data.stderr, 'terminal-error');
+                    data.stderr.split('\\n').forEach(line => {
+                        if (line) appendToTerminal(line, 'terminal-error');
+                    });
                 }
                 if (data.cwd) {
                     currentWorkingDir = data.cwd;
@@ -2000,13 +2377,81 @@ HTML_TEMPLATE = """
                 if (data.error) {
                     appendToTerminal('Error: ' + data.error, 'terminal-error');
                 }
-                document.getElementById('terminal-status').textContent = 'Ready';
-                document.getElementById('terminal-status').className = 'badge bg-success ms-2';
+                setTerminalLocked(false);
             })
             .catch(error => {
                 appendToTerminal('Error: ' + error.message, 'terminal-error');
-                document.getElementById('terminal-status').textContent = 'Error';
-                document.getElementById('terminal-status').className = 'badge bg-danger ms-2';
+                setTerminalLocked(false);
+            });
+        }
+        
+        function executeStreamingCommand(command, shell) {
+            // Use EventSource for streaming output
+            const params = new URLSearchParams({
+                command: command,
+                cwd: currentWorkingDir,
+                shell: shell
+            });
+            
+            // Use fetch with streaming for POST request
+            fetch('/api/terminal/stream', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    command: command,
+                    cwd: currentWorkingDir,
+                    shell: shell
+                })
+            })
+            .then(response => {
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                function read() {
+                    reader.read().then(({done, value}) => {
+                        if (done) {
+                            setTerminalLocked(false);
+                            return;
+                        }
+                        
+                        const text = decoder.decode(value);
+                        const lines = text.split('\\n');
+                        
+                        lines.forEach(line => {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.slice(6));
+                                    if (data.output) {
+                                        appendToTerminal(data.output.replace(/\\n$/, ''), 'terminal-output-text');
+                                    }
+                                    if (data.error) {
+                                        appendToTerminal('Error: ' + data.error, 'terminal-error');
+                                    }
+                                    if (data.cwd) {
+                                        currentWorkingDir = data.cwd;
+                                        updateTerminalPrompt();
+                                    }
+                                    if (data.complete) {
+                                        if (data.returncode === 0) {
+                                            appendToTerminal('✓ Command completed successfully', 'terminal-success');
+                                        } else if (data.returncode) {
+                                            appendToTerminal('✗ Command exited with code ' + data.returncode, 'terminal-error');
+                                        }
+                                        setTerminalLocked(false);
+                                    }
+                                } catch (e) {}
+                            }
+                        });
+                        
+                        read();
+                    });
+                }
+                
+                read();
+            })
+            .catch(error => {
+                appendToTerminal('Error: ' + error.message, 'terminal-error');
+                setTerminalLocked(false);
             });
         }
         
@@ -2391,6 +2836,405 @@ HTML_TEMPLATE = """
                 }
             });
         }
+        
+        // ==================== DOCKER FUNCTIONS ====================
+        let createContainerModal, pullImageModal, execModal;
+        let currentExecContainer = null;
+        let selectedLogContainer = null;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            createContainerModal = new bootstrap.Modal(document.getElementById('createContainerModal'));
+            pullImageModal = new bootstrap.Modal(document.getElementById('pullImageModal'));
+            execModal = new bootstrap.Modal(document.getElementById('execModal'));
+            
+            // Initial Docker check
+            checkDockerStatus();
+            
+            // Refresh Docker data every 5 seconds
+            setInterval(refreshDocker, 5000);
+        });
+        
+        function checkDockerStatus() {
+            fetch('/api/docker/status')
+                .then(response => response.json())
+                .then(data => {
+                    const statusBadge = document.getElementById('docker-status');
+                    if (data.available) {
+                        statusBadge.textContent = 'Running';
+                        statusBadge.className = 'badge bg-success ms-2';
+                        document.getElementById('docker-stats-row').style.display = 'flex';
+                        refreshDocker();
+                    } else {
+                        statusBadge.textContent = 'Not Available';
+                        statusBadge.className = 'badge bg-danger ms-2';
+                        document.getElementById('docker-stats-row').style.display = 'none';
+                        document.getElementById('docker-containers-list').innerHTML = 
+                            '<tr><td colspan="7" class="text-center text-danger">Docker is not running or not installed</td></tr>';
+                        document.getElementById('docker-images-list').innerHTML = 
+                            '<tr><td colspan="4" class="text-center text-danger">Docker is not available</td></tr>';
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('docker-status').textContent = 'Error';
+                    document.getElementById('docker-status').className = 'badge bg-danger ms-2';
+                });
+        }
+        
+        function refreshDocker() {
+            // Get containers
+            fetch('/api/docker/containers')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('docker-containers-list').innerHTML = 
+                            '<tr><td colspan="7" class="text-center text-danger">' + data.error + '</td></tr>';
+                        return;
+                    }
+                    
+                    const containers = data.containers || [];
+                    const running = containers.filter(c => c.status.startsWith('Up')).length;
+                    const stopped = containers.length - running;
+                    
+                    document.getElementById('docker-containers-total').textContent = containers.length;
+                    document.getElementById('docker-containers-running').textContent = running;
+                    document.getElementById('docker-containers-stopped').textContent = stopped;
+                    
+                    if (containers.length === 0) {
+                        document.getElementById('docker-containers-list').innerHTML = 
+                            '<tr><td colspan="7" class="text-center text-muted">No containers found</td></tr>';
+                    } else {
+                        document.getElementById('docker-containers-list').innerHTML = containers.map(c => {
+                            const isRunning = c.status.startsWith('Up');
+                            const statusClass = isRunning ? 'text-success' : 'text-warning';
+                            const statusIcon = isRunning ? 'play-circle-fill' : 'stop-circle-fill';
+                            return `
+                                <tr>
+                                    <td><strong>${c.name}</strong><br><small class="text-muted">${c.id.substring(0, 12)}</small></td>
+                                    <td><small>${c.image}</small></td>
+                                    <td><span class="${statusClass}"><i class="bi bi-${statusIcon}"></i> ${c.status}</span></td>
+                                    <td><small>${c.ports || '-'}</small></td>
+                                    <td>${c.cpu || '-'}</td>
+                                    <td>${c.memory || '-'}</td>
+                                    <td>
+                                        ${isRunning ? 
+                                            `<button class="btn btn-sm btn-outline-warning" onclick="stopContainer('${c.id}')" title="Stop">
+                                                <i class="bi bi-stop-fill"></i>
+                                            </button>
+                                            <button class="btn btn-sm btn-outline-danger" onclick="restartContainer('${c.id}')" title="Restart">
+                                                <i class="bi bi-arrow-clockwise"></i>
+                                            </button>` :
+                                            `<button class="btn btn-sm btn-outline-success" onclick="startContainer('${c.id}')" title="Start">
+                                                <i class="bi bi-play-fill"></i>
+                                            </button>`
+                                        }
+                                        <button class="btn btn-sm btn-outline-info" onclick="viewContainerLogs('${c.id}', '${c.name}')" title="Logs">
+                                            <i class="bi bi-file-text"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-dark" onclick="showExecModal('${c.id}', '${c.name}')" title="Exec">
+                                            <i class="bi bi-terminal"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-danger" onclick="removeContainer('${c.id}', '${c.name}')" title="Remove">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    </td>
+                                </tr>
+                            `;
+                        }).join('');
+                    }
+                });
+            
+            // Get images
+            fetch('/api/docker/images')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('docker-images-list').innerHTML = 
+                            '<tr><td colspan="4" class="text-center text-danger">' + data.error + '</td></tr>';
+                        return;
+                    }
+                    
+                    const images = data.images || [];
+                    document.getElementById('docker-images-total').textContent = images.length;
+                    
+                    if (images.length === 0) {
+                        document.getElementById('docker-images-list').innerHTML = 
+                            '<tr><td colspan="4" class="text-center text-muted">No images found</td></tr>';
+                    } else {
+                        document.getElementById('docker-images-list').innerHTML = images.map(img => `
+                            <tr>
+                                <td><small>${img.repository}</small></td>
+                                <td><span class="badge bg-secondary">${img.tag}</span></td>
+                                <td><small>${img.size}</small></td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-danger" onclick="removeImage('${img.id}')" title="Remove">
+                                        <i class="bi bi-trash"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                        `).join('');
+                    }
+                });
+        }
+        
+        function startContainer(containerId) {
+            fetch('/api/docker/container/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({container_id: containerId})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    refreshDocker();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function stopContainer(containerId) {
+            fetch('/api/docker/container/stop', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({container_id: containerId})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    refreshDocker();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function restartContainer(containerId) {
+            fetch('/api/docker/container/restart', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({container_id: containerId})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    refreshDocker();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function removeContainer(containerId, containerName) {
+            if (!confirm(`Remove container "${containerName}"? This cannot be undone.`)) return;
+            
+            fetch('/api/docker/container/remove', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({container_id: containerId, force: true})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    refreshDocker();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function removeImage(imageId) {
+            if (!confirm('Remove this image? This cannot be undone.')) return;
+            
+            fetch('/api/docker/image/remove', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({image_id: imageId})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    refreshDocker();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            });
+        }
+        
+        function viewContainerLogs(containerId, containerName) {
+            selectedLogContainer = containerId;
+            document.getElementById('logs-container-name').textContent = containerName;
+            
+            const lines = document.getElementById('logs-lines-select').value;
+            
+            fetch(`/api/docker/container/logs?container_id=${containerId}&lines=${lines}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.logs) {
+                        document.getElementById('container-logs').textContent = data.logs || 'No logs available';
+                        document.getElementById('container-logs').scrollTop = 
+                            document.getElementById('container-logs').scrollHeight;
+                    } else {
+                        document.getElementById('container-logs').textContent = 'Error: ' + (data.error || 'Unknown error');
+                    }
+                });
+        }
+        
+        function clearContainerLogs() {
+            document.getElementById('container-logs').textContent = 'Select a container to view logs...';
+            document.getElementById('logs-container-name').textContent = 'Select a container';
+            selectedLogContainer = null;
+        }
+        
+        function showCreateContainerModal() {
+            document.getElementById('create-container-form').reset();
+            document.getElementById('create-container-output').style.display = 'none';
+            createContainerModal.show();
+        }
+        
+        function createContainer() {
+            const image = document.getElementById('container-image').value;
+            if (!image) {
+                alert('Please enter an image name');
+                return;
+            }
+            
+            const config = {
+                image: image,
+                name: document.getElementById('container-name').value || null,
+                ports: document.getElementById('container-ports').value || null,
+                volumes: document.getElementById('container-volumes').value || null,
+                env: document.getElementById('container-env').value || null,
+                command: document.getElementById('container-command').value || null,
+                network: document.getElementById('container-network').value || null,
+                restart: document.getElementById('container-restart').value || null,
+                detach: document.getElementById('container-detach').checked,
+                rm: document.getElementById('container-rm').checked
+            };
+            
+            const outputDiv = document.getElementById('create-container-output');
+            const alertDiv = document.getElementById('create-container-alert');
+            outputDiv.style.display = 'block';
+            alertDiv.className = 'alert alert-info';
+            alertDiv.textContent = 'Creating container...';
+            
+            fetch('/api/docker/container/create', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(config)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alertDiv.className = 'alert alert-success';
+                    alertDiv.textContent = 'Container created successfully! ID: ' + (data.container_id || '').substring(0, 12);
+                    refreshDocker();
+                    setTimeout(() => createContainerModal.hide(), 2000);
+                } else {
+                    alertDiv.className = 'alert alert-danger';
+                    alertDiv.textContent = 'Error: ' + data.message;
+                }
+            })
+            .catch(error => {
+                alertDiv.className = 'alert alert-danger';
+                alertDiv.textContent = 'Error: ' + error.message;
+            });
+        }
+        
+        function showPullImageModal() {
+            document.getElementById('pull-image-name').value = '';
+            document.getElementById('pull-image-progress').style.display = 'none';
+            document.getElementById('pull-image-btn').disabled = false;
+            pullImageModal.show();
+        }
+        
+        function setPullImage(imageName) {
+            document.getElementById('pull-image-name').value = imageName;
+        }
+        
+        function pullImage() {
+            const imageName = document.getElementById('pull-image-name').value;
+            if (!imageName) {
+                alert('Please enter an image name');
+                return;
+            }
+            
+            document.getElementById('pull-image-progress').style.display = 'block';
+            document.getElementById('pull-image-btn').disabled = true;
+            document.getElementById('pull-image-status').textContent = 'Pulling image...';
+            document.getElementById('pull-progress-bar').style.width = '50%';
+            
+            fetch('/api/docker/image/pull', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({image: imageName})
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('pull-progress-bar').style.width = '100%';
+                if (data.status === 'success') {
+                    document.getElementById('pull-image-status').textContent = 'Image pulled successfully!';
+                    document.getElementById('pull-progress-bar').className = 'progress-bar bg-success';
+                    refreshDocker();
+                    setTimeout(() => pullImageModal.hide(), 2000);
+                } else {
+                    document.getElementById('pull-image-status').textContent = 'Error: ' + data.message;
+                    document.getElementById('pull-progress-bar').className = 'progress-bar bg-danger';
+                }
+                document.getElementById('pull-image-btn').disabled = false;
+            })
+            .catch(error => {
+                document.getElementById('pull-image-status').textContent = 'Error: ' + error.message;
+                document.getElementById('pull-progress-bar').className = 'progress-bar bg-danger';
+                document.getElementById('pull-image-btn').disabled = false;
+            });
+        }
+        
+        function showExecModal(containerId, containerName) {
+            currentExecContainer = containerId;
+            document.getElementById('exec-container-name').textContent = containerName;
+            document.getElementById('exec-output').textContent = 'Output will appear here...';
+            document.getElementById('exec-command').value = 'sh';
+            execModal.show();
+        }
+        
+        function execInContainer() {
+            if (!currentExecContainer) return;
+            
+            const command = document.getElementById('exec-command').value;
+            if (!command) {
+                alert('Please enter a command');
+                return;
+            }
+            
+            document.getElementById('exec-output').textContent = 'Executing...';
+            
+            fetch('/api/docker/container/exec', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    container_id: currentExecContainer,
+                    command: command
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.output !== undefined) {
+                    document.getElementById('exec-output').textContent = data.output || '(no output)';
+                } else {
+                    document.getElementById('exec-output').textContent = 'Error: ' + (data.error || data.message || 'Unknown error');
+                }
+            })
+            .catch(error => {
+                document.getElementById('exec-output').textContent = 'Error: ' + error.message;
+            });
+        }
+        
+        // Auto-refresh logs if a container is selected
+        setInterval(() => {
+            if (selectedLogContainer) {
+                viewContainerLogs(selectedLogContainer, document.getElementById('logs-container-name').textContent);
+            }
+        }, 5000);
     </script>
 </body>
 </html>
@@ -2490,6 +3334,9 @@ def get_resources():
     return jsonify(get_system_resources())
 
 # ==================== TERMINAL API ====================
+# Store running processes for streaming
+running_processes = {}
+
 @app.route('/api/terminal/execute', methods=['POST'])
 def terminal_execute():
     """Execute a terminal command and return output"""
@@ -2523,14 +3370,16 @@ def terminal_execute():
                     'stdout': '',
                     'stderr': '',
                     'cwd': new_dir,
-                    'returncode': 0
+                    'returncode': 0,
+                    'complete': True
                 })
             else:
                 return jsonify({
                     'stdout': '',
                     'stderr': f'cd: no such file or directory: {new_dir}',
                     'cwd': cwd,
-                    'returncode': 1
+                    'returncode': 1,
+                    'complete': True
                 })
         
         # Determine shell
@@ -2554,7 +3403,7 @@ def terminal_execute():
                 cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=300,  # 5 minute timeout
                 env={**os.environ, 'TERM': 'xterm-256color'}
             )
             
@@ -2562,26 +3411,109 @@ def terminal_execute():
                 'stdout': result.stdout,
                 'stderr': result.stderr,
                 'cwd': cwd,
-                'returncode': result.returncode
+                'returncode': result.returncode,
+                'complete': True
             })
         except subprocess.TimeoutExpired:
             return jsonify({
                 'stdout': '',
-                'stderr': 'Command timed out after 60 seconds',
+                'stderr': 'Command timed out after 5 minutes',
                 'cwd': cwd,
-                'returncode': -1
+                'returncode': -1,
+                'complete': True
             })
         except FileNotFoundError as e:
             return jsonify({
                 'stdout': '',
                 'stderr': f'Command not found: {str(e)}',
                 'cwd': cwd,
-                'returncode': 127
+                'returncode': 127,
+                'complete': True
             })
             
     except Exception as e:
         log_system_event('error', f'Terminal execution error: {str(e)}')
-        return jsonify({'error': str(e)})
+        return jsonify({'error': str(e), 'complete': True})
+
+@app.route('/api/terminal/stream', methods=['POST'])
+def terminal_stream():
+    """Execute a terminal command with streaming output"""
+    from flask import Response, stream_with_context
+    
+    data = request.json
+    command = data.get('command', '')
+    cwd = data.get('cwd', os.getcwd())
+    shell_type = data.get('shell', 'auto')
+    
+    if not command:
+        return jsonify({'error': 'No command provided'})
+    
+    if not os.path.isdir(cwd):
+        cwd = os.getcwd()
+    
+    # Handle cd command specially
+    if command.strip().startswith('cd '):
+        new_dir = command.strip()[3:].strip()
+        if new_dir == '~':
+            new_dir = os.path.expanduser('~')
+        elif new_dir == '-':
+            new_dir = cwd
+        elif not os.path.isabs(new_dir):
+            new_dir = os.path.join(cwd, new_dir)
+        new_dir = os.path.normpath(new_dir)
+        if os.path.isdir(new_dir):
+            return jsonify({'cwd': new_dir, 'complete': True})
+        else:
+            return jsonify({'stderr': f'cd: no such file or directory: {new_dir}', 'cwd': cwd, 'complete': True})
+    
+    # Determine shell
+    if shell_type == 'auto':
+        shell = '/bin/bash' if platform.system() != 'Windows' else 'cmd.exe'
+    else:
+        shell = shell_type
+    
+    def generate():
+        try:
+            if platform.system() == 'Windows':
+                process = subprocess.Popen(
+                    ['cmd.exe', '/c', command],
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env={**os.environ}
+                )
+            else:
+                process = subprocess.Popen(
+                    [shell, '-c', command],
+                    cwd=cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    env={**os.environ, 'TERM': 'xterm-256color'}
+                )
+            
+            # Stream output line by line
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    yield f"data: {json.dumps({'output': line})}\n\n"
+            
+            process.wait()
+            yield f"data: {json.dumps({'complete': True, 'returncode': process.returncode, 'cwd': cwd})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e), 'complete': True})}\n\n"
+    
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 # ==================== FILE UPLOAD API ====================
 @app.route('/api/upload', methods=['POST'])
@@ -2795,6 +3727,407 @@ def download_file():
         
     except Exception as e:
         log_system_event('error', f'File download error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+# ==================== DOCKER API ====================
+def run_docker_command(args, timeout=30):
+    """Run a docker command and return output - cross-platform"""
+    try:
+        # Determine docker command based on platform
+        docker_cmd = 'docker'
+        if platform.system() == 'Windows':
+            # Check for Docker Desktop on Windows
+            docker_paths = [
+                'docker',
+                r'C:\Program Files\Docker\Docker\resources\bin\docker.exe',
+                r'C:\ProgramData\DockerDesktop\version-bin\docker.exe'
+            ]
+            for path in docker_paths:
+                try:
+                    result = subprocess.run([path, '--version'], capture_output=True, timeout=5)
+                    if result.returncode == 0:
+                        docker_cmd = path
+                        break
+                except:
+                    continue
+        
+        result = subprocess.run(
+            [docker_cmd] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return {
+            'stdout': result.stdout,
+            'stderr': result.stderr,
+            'returncode': result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {'stdout': '', 'stderr': 'Command timed out', 'returncode': -1}
+    except FileNotFoundError:
+        return {'stdout': '', 'stderr': 'Docker not found', 'returncode': -1}
+    except Exception as e:
+        return {'stdout': '', 'stderr': str(e), 'returncode': -1}
+
+@app.route('/api/docker/status')
+def docker_status():
+    """Check if Docker is available and running"""
+    try:
+        result = run_docker_command(['info'], timeout=10)
+        if result['returncode'] == 0:
+            return jsonify({'available': True, 'info': result['stdout']})
+        else:
+            return jsonify({'available': False, 'error': result['stderr']})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)})
+
+@app.route('/api/docker/containers')
+def docker_containers():
+    """List all Docker containers with stats"""
+    try:
+        # Get all containers
+        result = run_docker_command([
+            'ps', '-a', '--format', 
+            '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'
+        ])
+        
+        if result['returncode'] != 0:
+            return jsonify({'error': result['stderr'] or 'Failed to list containers'})
+        
+        containers = []
+        lines = result['stdout'].strip().split('\n') if result['stdout'].strip() else []
+        
+        for line in lines:
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) >= 5:
+                container = {
+                    'id': parts[0],
+                    'name': parts[1],
+                    'image': parts[2],
+                    'status': parts[3],
+                    'ports': parts[4] if parts[4] else '-',
+                    'cpu': '-',
+                    'memory': '-'
+                }
+                containers.append(container)
+        
+        # Get stats for running containers
+        if containers:
+            stats_result = run_docker_command([
+                'stats', '--no-stream', '--format',
+                '{{.Container}}|{{.CPUPerc}}|{{.MemUsage}}'
+            ], timeout=15)
+            
+            if stats_result['returncode'] == 0 and stats_result['stdout']:
+                stats_lines = stats_result['stdout'].strip().split('\n')
+                stats_map = {}
+                for stat_line in stats_lines:
+                    stat_parts = stat_line.split('|')
+                    if len(stat_parts) >= 3:
+                        stats_map[stat_parts[0]] = {
+                            'cpu': stat_parts[1],
+                            'memory': stat_parts[2]
+                        }
+                
+                for container in containers:
+                    if container['id'] in stats_map:
+                        container['cpu'] = stats_map[container['id']]['cpu']
+                        container['memory'] = stats_map[container['id']]['memory']
+                    elif container['name'] in stats_map:
+                        container['cpu'] = stats_map[container['name']]['cpu']
+                        container['memory'] = stats_map[container['name']]['memory']
+        
+        return jsonify({'containers': containers})
+        
+    except Exception as e:
+        log_system_event('error', f'Docker containers error: {str(e)}')
+        return jsonify({'error': str(e)})
+
+@app.route('/api/docker/images')
+def docker_images():
+    """List all Docker images"""
+    try:
+        result = run_docker_command([
+            'images', '--format',
+            '{{.ID}}|{{.Repository}}|{{.Tag}}|{{.Size}}'
+        ])
+        
+        if result['returncode'] != 0:
+            return jsonify({'error': result['stderr'] or 'Failed to list images'})
+        
+        images = []
+        lines = result['stdout'].strip().split('\n') if result['stdout'].strip() else []
+        
+        for line in lines:
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) >= 4:
+                images.append({
+                    'id': parts[0],
+                    'repository': parts[1],
+                    'tag': parts[2],
+                    'size': parts[3]
+                })
+        
+        return jsonify({'images': images})
+        
+    except Exception as e:
+        log_system_event('error', f'Docker images error: {str(e)}')
+        return jsonify({'error': str(e)})
+
+@app.route('/api/docker/container/start', methods=['POST'])
+def docker_container_start():
+    """Start a container"""
+    try:
+        data = request.json
+        container_id = data.get('container_id')
+        
+        if not container_id:
+            return jsonify({'status': 'error', 'message': 'No container ID provided'})
+        
+        result = run_docker_command(['start', container_id])
+        
+        if result['returncode'] == 0:
+            log_system_event('info', f'Started container: {container_id}')
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/container/stop', methods=['POST'])
+def docker_container_stop():
+    """Stop a container"""
+    try:
+        data = request.json
+        container_id = data.get('container_id')
+        
+        if not container_id:
+            return jsonify({'status': 'error', 'message': 'No container ID provided'})
+        
+        result = run_docker_command(['stop', container_id], timeout=30)
+        
+        if result['returncode'] == 0:
+            log_system_event('info', f'Stopped container: {container_id}')
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/container/restart', methods=['POST'])
+def docker_container_restart():
+    """Restart a container"""
+    try:
+        data = request.json
+        container_id = data.get('container_id')
+        
+        if not container_id:
+            return jsonify({'status': 'error', 'message': 'No container ID provided'})
+        
+        result = run_docker_command(['restart', container_id], timeout=60)
+        
+        if result['returncode'] == 0:
+            log_system_event('info', f'Restarted container: {container_id}')
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/container/remove', methods=['POST'])
+def docker_container_remove():
+    """Remove a container"""
+    try:
+        data = request.json
+        container_id = data.get('container_id')
+        force = data.get('force', False)
+        
+        if not container_id:
+            return jsonify({'status': 'error', 'message': 'No container ID provided'})
+        
+        args = ['rm']
+        if force:
+            args.append('-f')
+        args.append(container_id)
+        
+        result = run_docker_command(args)
+        
+        if result['returncode'] == 0:
+            log_system_event('warning', f'Removed container: {container_id}')
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/container/logs')
+def docker_container_logs():
+    """Get container logs"""
+    try:
+        container_id = request.args.get('container_id')
+        lines = request.args.get('lines', '100')
+        
+        if not container_id:
+            return jsonify({'error': 'No container ID provided'})
+        
+        result = run_docker_command(['logs', '--tail', lines, container_id], timeout=30)
+        
+        # Combine stdout and stderr for logs
+        logs = result['stdout'] + result['stderr']
+        
+        return jsonify({'logs': logs})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/docker/container/exec', methods=['POST'])
+def docker_container_exec():
+    """Execute command in container"""
+    try:
+        data = request.json
+        container_id = data.get('container_id')
+        command = data.get('command', 'sh')
+        
+        if not container_id:
+            return jsonify({'error': 'No container ID provided'})
+        
+        # Split command if it contains spaces
+        cmd_parts = command.split() if ' ' in command else [command]
+        
+        result = run_docker_command(['exec', container_id] + cmd_parts, timeout=30)
+        
+        output = result['stdout'] + result['stderr']
+        
+        return jsonify({'output': output, 'returncode': result['returncode']})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/docker/container/create', methods=['POST'])
+def docker_container_create():
+    """Create and optionally start a new container"""
+    try:
+        data = request.json
+        image = data.get('image')
+        
+        if not image:
+            return jsonify({'status': 'error', 'message': 'No image specified'})
+        
+        # Build docker run command
+        args = ['run']
+        
+        # Detached mode
+        if data.get('detach', True):
+            args.append('-d')
+        
+        # Remove when stopped
+        if data.get('rm', False):
+            args.append('--rm')
+        
+        # Container name
+        if data.get('name'):
+            args.extend(['--name', data['name']])
+        
+        # Port mappings
+        if data.get('ports'):
+            ports = data['ports'].split(',')
+            for port in ports:
+                port = port.strip()
+                if port:
+                    args.extend(['-p', port])
+        
+        # Volume mappings
+        if data.get('volumes'):
+            volumes = data['volumes'].split(',')
+            for volume in volumes:
+                volume = volume.strip()
+                if volume:
+                    args.extend(['-v', volume])
+        
+        # Environment variables
+        if data.get('env'):
+            env_vars = data['env'].strip().split('\n')
+            for env_var in env_vars:
+                env_var = env_var.strip()
+                if env_var and '=' in env_var:
+                    args.extend(['-e', env_var])
+        
+        # Network
+        if data.get('network'):
+            args.extend(['--network', data['network']])
+        
+        # Restart policy
+        if data.get('restart'):
+            args.extend(['--restart', data['restart']])
+        
+        # Image
+        args.append(image)
+        
+        # Command
+        if data.get('command'):
+            args.extend(data['command'].split())
+        
+        result = run_docker_command(args, timeout=120)
+        
+        if result['returncode'] == 0:
+            container_id = result['stdout'].strip()
+            log_system_event('info', f'Created container from {image}: {container_id}')
+            return jsonify({'status': 'success', 'container_id': container_id})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        log_system_event('error', f'Container creation error: {str(e)}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/image/pull', methods=['POST'])
+def docker_image_pull():
+    """Pull a Docker image"""
+    try:
+        data = request.json
+        image = data.get('image')
+        
+        if not image:
+            return jsonify({'status': 'error', 'message': 'No image specified'})
+        
+        result = run_docker_command(['pull', image], timeout=300)  # 5 min timeout for large images
+        
+        if result['returncode'] == 0:
+            log_system_event('info', f'Pulled image: {image}')
+            return jsonify({'status': 'success', 'output': result['stdout']})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/api/docker/image/remove', methods=['POST'])
+def docker_image_remove():
+    """Remove a Docker image"""
+    try:
+        data = request.json
+        image_id = data.get('image_id')
+        
+        if not image_id:
+            return jsonify({'status': 'error', 'message': 'No image ID provided'})
+        
+        result = run_docker_command(['rmi', image_id])
+        
+        if result['returncode'] == 0:
+            log_system_event('warning', f'Removed image: {image_id}')
+            return jsonify({'status': 'success'})
+        else:
+            return jsonify({'status': 'error', 'message': result['stderr']})
+            
+    except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
 # Graceful shutdown handler
